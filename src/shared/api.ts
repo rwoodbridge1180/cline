@@ -156,6 +156,40 @@ export const bedrockModels = {
 		inputPrice: 0.25,
 		outputPrice: 1.25,
 	},
+    "amazon.nova-20240920-large:0": { 
+        maxTokens: 200000, 
+        supportsPromptCache: false, 
+        inputPrice: 0.0008, 
+        outputPrice: 0.0032, 
+        cacheReadsPrice: 0.0002
+    },
+    "us.amazon.nova-pro-v1:0": { 
+        maxTokens: 5000, 
+        contextWindow: 300000, 
+        supportsPromptCache: false, 
+        supportsImages: true, 
+        inputPrice: 0.0008, 
+        outputPrice: 0.0032, 
+        cacheReadsPrice: 0.0002 
+    },
+	"us.amazon.nova-lite-v1:0": {
+        maxTokens: 5000, 
+        contextWindow: 300000, 
+        supportsPromptCache: false, 
+        supportsImages: true, 
+        inputPrice: 0.00006, 
+        outputPrice: 0.00024, 
+        cacheReadsPrice: 0.000015 
+    },
+	"us.amazon.nova-micro-v1:0": {
+        maxTokens: 5000, 
+        contextWindow: 128000, 
+        supportsPromptCache: false, 
+        supportsImages: false, 
+        inputPrice: 0.000035, 
+        outputPrice: 0.00014, 
+        cacheReadsPrice: 0.00000875
+    },
 } as const satisfies Record<string, ModelInfo>
 
 // OpenRouter

@@ -1,383 +1,216 @@
-export type ApiProvider =
-	| "anthropic"
-	| "openrouter"
-	| "bedrock"
-	| "vertex"
-	| "openai"
-	| "ollama"
-	| "lmstudio"
-	| "gemini"
-	| "openai-native"
+import AnthropicBedrock from "@anthropic-ai/bedrock-sdk"
+import { Anthropic } from "@anthropic-ai/sdk"
+import { ApiHandler } from "../"
+import { ApiHandlerOptions, bedrockDefaultModelId, BedrockModelId, bedrockModels, ModelInfo } from "../../shared/api"
+import { ApiStream } from "../transform/stream"
+import {  BedrockRuntime } from 'aws-sdk'
+import { InvokeModelCommand, InvokeModelWithResponseStreamCommand, BedrockRuntimeClient } from "@aws-sdk/client-bedrock-runtime";
+import { Readable } from "stream";
 
-export interface ApiHandlerOptions {
-	apiModelId?: string
-	apiKey?: string // anthropic
-	anthropicBaseUrl?: string
-	openRouterApiKey?: string
-	openRouterModelId?: string
-	openRouterModelInfo?: ModelInfo
-	awsAccessKey?: string
-	awsSecretKey?: string
-	awsSessionToken?: string
-	awsRegion?: string
-	awsUseCrossRegionInference?: boolean
-	vertexProjectId?: string
-	vertexRegion?: string
-	openAiBaseUrl?: string
-	openAiApiKey?: string
-	openAiModelId?: string
-	ollamaModelId?: string
-	ollamaBaseUrl?: string
-	lmStudioModelId?: string
-	lmStudioBaseUrl?: string
-	geminiApiKey?: string
-	openAiNativeApiKey?: string
-	azureApiVersion?: string
+// https://docs.anthropic.com/en/api/claude-on-amazon-bedrock
+export class AwsBedrockHandler implements ApiHandler {
+	private options: ApiHandlerOptions
+	private client: AnthropicBedrock
+  private bedrock: BedrockRuntimeClient;
+
+	constructor(options: ApiHandlerOptions) {
+		this.options = options
+		this.client = new AnthropicBedrock({
+			// Authenticate by either providing the keys below or use the default AWS credential providers, such as
+			// using ~/.aws/credentials or the "AWS_SECRET_ACCESS_KEY" and "AWS_ACCESS_KEY_ID" environment variables.
+			...(this.options.awsAccessKey ? { awsAccessKey: this.options.awsAccessKey } : {}),
+			...(this.options.awsSecretKey ? { awsSecretKey: this.options.awsSecretKey } : {}),
+			...(this.options.awsSessionToken ? { awsSessionToken: this.options.awsSessionToken } : {}),
+
+			// awsRegion changes the aws region to which the request is made. By default, we read AWS_REGION,
+			// and if that's not present, we default to us-east-1. Note that we do not read ~/.aws/config for the region.
+			awsRegion: this.options.awsRegion,
+		})
+      this.bedrock = new BedrockRuntimeClient({
+			...(this.options.awsAccessKey ? { credentials: {accessKeyId: this.options.awsAccessKey, secretAccessKey: this.options.awsSecretKey || "", sessionToken: this.options.awsSessionToken || ""} } : {}),
+			region: this.options.awsRegion,
+		});
+	}
+
+	async *createMessage(systemPrompt: string, messages: Anthropic.Messages.MessageParam[]): ApiStream {
+        const model = this.getModel();
+		// cross region inference requires prefixing the model id with the region
+		let modelId: string
+		if (this.options.awsUseCrossRegionInference) {
+			let regionPrefix = (this.options.awsRegion || "").slice(0, 3)
+			switch (regionPrefix) {
+				case "us-":
+					modelId = `us.${model.id}`
+					break
+				case "eu-":
+					modelId = `eu.${model.id}`
+					break
+				default:
+					// cross region inference is not supported in this region, falling back to default model
+					modelId = model.id
+					break
+			}
+		} else {
+			modelId = model.id
+		}
+
+        if (model.id.startsWith("anthropic")) {
+		const stream = await this.client.messages.create({
+			model: modelId,
+			max_tokens: model.info.maxTokens || 8192,
+			temperature: 0,
+			system: systemPrompt,
+			messages,
+			stream: true,
+		})
+		for await (const chunk of stream) {
+			switch (chunk.type) {
+				case "message_start":
+					const usage = chunk.message.usage
+					yield {
+						type: "usage",
+						inputTokens: usage.input_tokens || 0,
+						outputTokens: usage.output_tokens || 0,
+					}
+					break
+				case "message_delta":
+					yield {
+						type: "usage",
+						inputTokens: 0,
+						outputTokens: chunk.usage.output_tokens || 0,
+					}
+					break
+
+				case "content_block_start":
+					switch (chunk.content_block.type) {
+						case "text":
+							if (chunk.index > 0) {
+								yield {
+									type: "text",
+									text: "\n",
+								}
+							}
+							yield {
+								type: "text",
+								text: chunk.content_block.text,
+							}
+							break
+					}
+					break
+				case "content_block_delta":
+					switch (chunk.delta.type) {
+						case "text_delta":
+							yield {
+								type: "text",
+								text: chunk.delta.text,
+							}
+							break
+					}
+					break
+			}
+		}
+     }
+        else if (model.id.startsWith("amazon")) {
+            const command = new InvokeModelWithResponseStreamCommand({
+                modelId: modelId,
+                contentType: "application/json",
+                accept: "application/json",
+                body: JSON.stringify({
+					messages: messages,
+					temperature: 0,
+					max_tokens: model.info.maxTokens || 8192,
+				}),
+            });
+            const response = await this.bedrock.send(command);
+             if (response.body) {
+                for await (const event of response.body) {
+
+                    if(event.chunk) {
+                        const responseBody = JSON.parse(new TextDecoder().decode(event.chunk.bytes));
+                         const usage = responseBody.usage;
+                        if (usage) {
+                             yield {
+                                type: "usage",
+                                inputTokens: usage.inputTokens || 0,
+                                outputTokens: usage.outputTokens || 0
+                             }
+                         }
+                         if(responseBody.messages) {
+                              for(const message of responseBody.messages) {
+                                    yield {
+                                       type: "text",
+                                        text: message.content
+                                    }
+                                }
+                         } else if(responseBody.completion) {
+                                yield {
+                                     type: "text",
+                                     text: responseBody.completion
+                                }
+                            }
+                    }
+                 }
+             }
+        }
+	}
+
+    async *invokeModel(prompt: string): ApiStream {
+        const model = this.getModel();
+        let modelId: string
+		if (this.options.awsUseCrossRegionInference) {
+			let regionPrefix = (this.options.awsRegion || "").slice(0, 3)
+			switch (regionPrefix) {
+				case "us-":
+					modelId = `us.${model.id}`
+					break
+				case "eu-":
+					modelId = `eu.${model.id}`
+					break
+				default:
+					// cross region inference is not supported in this region, falling back to default model
+					modelId = model.id
+					break
+			}
+		} else {
+			modelId = model.id
+		}
+        
+        if (model.id.startsWith("amazon")) {
+            const command = new InvokeModelCommand({
+                 modelId: modelId,
+                 contentType: "application/json",
+                 accept: "application/json",
+                 body: JSON.stringify({
+                     prompt: prompt,
+                     temperature: 0,
+                     max_tokens: model.info.maxTokens || 8192,
+                 }),
+            })
+            const response = await this.bedrock.send(command);
+            const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+            const usage = responseBody.usage;
+
+             if(usage) {
+                  yield {
+                     type: "usage",
+                     inputTokens: usage.inputTokens || 0,
+                     outputTokens: usage.outputTokens || 0
+                }
+            }
+
+           yield {
+               type: "text",
+                text: responseBody.completion
+            }
+        }
+    }
+
+	getModel(): { id: BedrockModelId; info: ModelInfo } {
+		const modelId = this.options.apiModelId
+		if (modelId && modelId in bedrockModels) {
+			const id = modelId as BedrockModelId
+			return { id, info: bedrockModels[id] }
+		}
+		return { id: bedrockDefaultModelId, info: bedrockModels[bedrockDefaultModelId] }
+	}
 }
-
-export type ApiConfiguration = ApiHandlerOptions & {
-	apiProvider?: ApiProvider
-}
-
-// Models
-
-export interface ModelInfo {
-	maxTokens?: number
-	contextWindow?: number
-	supportsImages?: boolean
-	supportsComputerUse?: boolean
-	supportsPromptCache: boolean // this value is hardcoded for now
-	inputPrice?: number
-	outputPrice?: number
-	cacheWritesPrice?: number
-	cacheReadsPrice?: number
-	description?: string
-}
-
-// Anthropic
-// https://docs.anthropic.com/en/docs/about-claude/models
-export type AnthropicModelId = keyof typeof anthropicModels
-export const anthropicDefaultModelId: AnthropicModelId = "claude-3-5-sonnet-20241022"
-export const anthropicModels = {
-	"claude-3-5-sonnet-20241022": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsComputerUse: true,
-		supportsPromptCache: true,
-		inputPrice: 3.0, // $3 per million input tokens
-		outputPrice: 15.0, // $15 per million output tokens
-		cacheWritesPrice: 3.75, // $3.75 per million tokens
-		cacheReadsPrice: 0.3, // $0.30 per million tokens
-	},
-	"claude-3-5-haiku-20241022": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: false,
-		supportsPromptCache: true,
-		inputPrice: 1.0,
-		outputPrice: 5.0,
-		cacheWritesPrice: 1.25,
-		cacheReadsPrice: 0.1,
-	},
-	"claude-3-opus-20240229": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: true,
-		inputPrice: 15.0,
-		outputPrice: 75.0,
-		cacheWritesPrice: 18.75,
-		cacheReadsPrice: 1.5,
-	},
-	"claude-3-haiku-20240307": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: true,
-		inputPrice: 0.25,
-		outputPrice: 1.25,
-		cacheWritesPrice: 0.3,
-		cacheReadsPrice: 0.03,
-	},
-} as const satisfies Record<string, ModelInfo> // as const assertion makes the object deeply readonly
-
-// AWS Bedrock
-// https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html
-export type BedrockModelId = keyof typeof bedrockModels
-export const bedrockDefaultModelId: BedrockModelId = "anthropic.claude-3-5-sonnet-20241022-v2:0"
-export const bedrockModels = {
-	"anthropic.claude-3-5-sonnet-20241022-v2:0": {
-		maxTokens: 200000,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsComputerUse: true,
-		supportsPromptCache: false,
-		inputPrice: 3.0,
-		outputPrice: 15.0,
-	},
-	"anthropic.claude-3-5-haiku-20241022-v1:0": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: false,
-		supportsPromptCache: false,
-		inputPrice: 1.0,
-		outputPrice: 5.0,
-	},
-	"anthropic.claude-3-5-sonnet-20240620-v1:0": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 3.0,
-		outputPrice: 15.0,
-	},
-	"anthropic.claude-3-opus-20240229-v1:0": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 15.0,
-		outputPrice: 75.0,
-	},
-	"anthropic.claude-3-sonnet-20240229-v1:0": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 3.0,
-		outputPrice: 15.0,
-	},
-	"anthropic.claude-3-haiku-20240307-v1:0": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0.25,
-		outputPrice: 1.25,
-	},
-    "amazon.nova-20240920-large:0": { 
-        maxTokens: 200000, 
-        supportsPromptCache: false, 
-        inputPrice: 0.0008, 
-        outputPrice: 0.0032, 
-        cacheReadsPrice: 0.0002
-    },
-    "us.amazon.nova-pro-v1:0": { 
-        maxTokens: 5000, 
-        contextWindow: 300000, 
-        supportsPromptCache: false, 
-        supportsImages: true, 
-        inputPrice: 0.0008, 
-        outputPrice: 0.0032, 
-        cacheReadsPrice: 0.0002 
-    },
-	"us.amazon.nova-lite-v1:0": {
-        maxTokens: 5000, 
-        contextWindow: 300000, 
-        supportsPromptCache: false, 
-        supportsImages: true, 
-        inputPrice: 0.00006, 
-        outputPrice: 0.00024, 
-        cacheReadsPrice: 0.000015 
-    },
-	"us.amazon.nova-micro-v1:0": {
-        maxTokens: 5000, 
-        contextWindow: 128000, 
-        supportsPromptCache: false, 
-        supportsImages: false, 
-        inputPrice: 0.000035, 
-        outputPrice: 0.00014, 
-        cacheReadsPrice: 0.00000875
-    },
-} as const satisfies Record<string, ModelInfo>
-
-// OpenRouter
-// https://openrouter.ai/models?order=newest&supported_parameters=tools
-export const openRouterDefaultModelId = "anthropic/claude-3.5-sonnet:beta" // will always exist in openRouterModels
-export const openRouterDefaultModelInfo: ModelInfo = {
-	maxTokens: 8192,
-	contextWindow: 200_000,
-	supportsImages: true,
-	supportsComputerUse: true,
-	supportsPromptCache: true,
-	inputPrice: 3.0,
-	outputPrice: 15.0,
-	cacheWritesPrice: 3.75,
-	cacheReadsPrice: 0.3,
-	description:
-		"The new Claude 3.5 Sonnet delivers better-than-Opus capabilities, faster-than-Sonnet speeds, at the same Sonnet prices. Sonnet is particularly good at:\n\n- Coding: New Sonnet scores ~49% on SWE-Bench Verified, higher than the last best score, and without any fancy prompt scaffolding\n- Data science: Augments human data science expertise; navigates unstructured data while using multiple tools for insights\n- Visual processing: excelling at interpreting charts, graphs, and images, accurately transcribing text to derive insights beyond just the text alone\n- Agentic tasks: exceptional tool use, making it great at agentic tasks (i.e. complex, multi-step problem solving tasks that require engaging with other systems)\n\n#multimodal\n\n_This is a faster endpoint, made available in collaboration with Anthropic, that is self-moderated: response moderation happens on the provider's side instead of OpenRouter's. For requests that pass moderation, it's identical to the [Standard](/anthropic/claude-3.5-sonnet) variant._",
-}
-
-// Vertex AI
-// https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude
-export type VertexModelId = keyof typeof vertexModels
-export const vertexDefaultModelId: VertexModelId = "claude-3-5-sonnet-v2@20241022"
-export const vertexModels = {
-	"claude-3-5-sonnet-v2@20241022": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsComputerUse: true,
-		supportsPromptCache: false,
-		inputPrice: 3.0,
-		outputPrice: 15.0,
-	},
-	"claude-3-5-sonnet@20240620": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 3.0,
-		outputPrice: 15.0,
-	},
-	"claude-3-5-haiku@20241022": {
-		maxTokens: 8192,
-		contextWindow: 200_000,
-		supportsImages: false,
-		supportsPromptCache: false,
-		inputPrice: 1.0,
-		outputPrice: 5.0,
-	},
-	"claude-3-opus@20240229": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 15.0,
-		outputPrice: 75.0,
-	},
-	"claude-3-haiku@20240307": {
-		maxTokens: 4096,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0.25,
-		outputPrice: 1.25,
-	},
-} as const satisfies Record<string, ModelInfo>
-
-export const openAiModelInfoSaneDefaults: ModelInfo = {
-	maxTokens: -1,
-	contextWindow: 128_000,
-	supportsImages: true,
-	supportsPromptCache: false,
-	inputPrice: 0,
-	outputPrice: 0,
-}
-
-// Gemini
-// https://ai.google.dev/gemini-api/docs/models/gemini
-export type GeminiModelId = keyof typeof geminiModels
-export const geminiDefaultModelId: GeminiModelId = "gemini-2.0-flash-thinking-exp-1219"
-export const geminiModels = {
-	"gemini-2.0-flash-thinking-exp-1219": {
-		maxTokens: 8192,
-		contextWindow: 32_767,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-2.0-flash-exp": {
-		maxTokens: 8192,
-		contextWindow: 1_048_576,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-exp-1206": {
-		maxTokens: 8192,
-		contextWindow: 2_097_152,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-1.5-flash-002": {
-		maxTokens: 8192,
-		contextWindow: 1_048_576,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-1.5-flash-exp-0827": {
-		maxTokens: 8192,
-		contextWindow: 1_048_576,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-1.5-flash-8b-exp-0827": {
-		maxTokens: 8192,
-		contextWindow: 1_048_576,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-1.5-pro-002": {
-		maxTokens: 8192,
-		contextWindow: 2_097_152,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-	"gemini-1.5-pro-exp-0827": {
-		maxTokens: 8192,
-		contextWindow: 2_097_152,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0,
-		outputPrice: 0,
-	},
-} as const satisfies Record<string, ModelInfo>
-
-// OpenAI Native
-// https://openai.com/api/pricing/
-export type OpenAiNativeModelId = keyof typeof openAiNativeModels
-export const openAiNativeDefaultModelId: OpenAiNativeModelId = "gpt-4o"
-export const openAiNativeModels = {
-	// don't support tool use yet
-	"o1": {
-		maxTokens: 100000,
-		contextWindow: 200_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 15,
-		outputPrice: 60,
-	},
-	"o1-mini": {
-		maxTokens: 65536,
-		contextWindow: 128_000,
-		supportsImages: false,
-		supportsPromptCache: false,
-		inputPrice: 3,
-		outputPrice: 12,
-	},
-    "gpt-4o": {
-		maxTokens: 4_096,
-		contextWindow: 128_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 5,
-		outputPrice: 15,
-	},
-	"gpt-4o-mini": {
-		maxTokens: 16_384,
-		contextWindow: 128_000,
-		supportsImages: true,
-		supportsPromptCache: false,
-		inputPrice: 0.15,
-		outputPrice: 0.6,
-	},
-} as const satisfies Record<string, ModelInfo>
-
-// Azure OpenAI
-// https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation
-// https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#api-specs
-export const azureOpenAiDefaultApiVersion = "2024-08-01-preview"
